@@ -6,6 +6,7 @@ Hold the hotkey to record, release to transcribe and copy to clipboard.
 
 import argparse
 import configparser
+import json
 import platform
 import subprocess
 import tempfile
@@ -34,6 +35,7 @@ def load_config():
         "model": "base.en",
         "device": "cpu",
         "compute_type": "int8",
+        "language": "",
         "key": "f12",
         "auto_type": "true",
         "notifications": "true",
@@ -46,6 +48,7 @@ def load_config():
         "model": config.get("whisper", "model", fallback=defaults["model"]),
         "device": config.get("whisper", "device", fallback=defaults["device"]),
         "compute_type": config.get("whisper", "compute_type", fallback=defaults["compute_type"]),
+        "language": config.get("whisper", "language", fallback=defaults["language"]),
         "key": config.get("hotkey", "key", fallback=defaults["key"]),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
@@ -53,6 +56,31 @@ def load_config():
 
 
 CONFIG = load_config()
+
+
+def get_default_input_device():
+    """Name of the system default audio input device, or None if unknown."""
+    if not IS_MACOS:
+        return None  # arecord uses the ALSA "default" device
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPAudioDataType", "-json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        items = json.loads(result.stdout)["SPAudioDataType"][0]["_items"]
+        for item in items:
+            if item.get("coreaudio_default_audio_input_device") == "spaudio_yes":
+                return item["_name"]
+    except Exception:
+        pass
+    return None
+
+
+def print_input_device():
+    """Print the current default input device (slow query, run in a thread)."""
+    device = get_default_input_device()
+    if device:
+        print(f"Recording from: {device}")
 
 
 def get_hotkey(key_name):
@@ -71,6 +99,7 @@ HOTKEY = get_hotkey(CONFIG["key"])
 MODEL_SIZE = CONFIG["model"]
 DEVICE = CONFIG["device"]
 COMPUTE_TYPE = CONFIG["compute_type"]
+LANGUAGE = CONFIG["language"] or None  # None = auto-detect
 AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
 
@@ -88,6 +117,9 @@ class Dictation:
         # Load model in background
         print(f"Loading Whisper model ({MODEL_SIZE})...")
         threading.Thread(target=self._load_model, daemon=True).start()
+
+        # system_profiler takes a couple of seconds, don't block startup
+        threading.Thread(target=print_input_device, daemon=True).start()
 
     def _load_model(self):
         try:
@@ -204,6 +236,7 @@ class Dictation:
                 self.temp_file.name,
                 beam_size=5,
                 vad_filter=True,
+                language=LANGUAGE,
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
