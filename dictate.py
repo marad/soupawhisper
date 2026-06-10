@@ -6,6 +6,7 @@ Hold the hotkey to record, release to transcribe and copy to clipboard.
 
 import argparse
 import configparser
+import platform
 import subprocess
 import tempfile
 import threading
@@ -18,6 +19,8 @@ from pynput import keyboard
 from faster_whisper import WhisperModel
 
 __version__ = "0.1.0"
+
+IS_MACOS = platform.system() == "Darwin"
 
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
@@ -105,6 +108,20 @@ class Dictation:
         """Send a desktop notification."""
         if not NOTIFICATIONS:
             return
+        if IS_MACOS:
+            # Pass title/message via argv to avoid AppleScript string escaping
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e", "on run argv",
+                    "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+                    "-e", "end run",
+                    title,
+                    message
+                ],
+                capture_output=True
+            )
+            return
         subprocess.run(
             [
                 "notify-send",
@@ -126,16 +143,28 @@ class Dictation:
         self.temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         self.temp_file.close()
 
-        # Record using arecord (ALSA) - works on most Linux systems
-        self.record_process = subprocess.Popen(
-            [
+        if IS_MACOS:
+            # Record using sox's rec (CoreAudio default input)
+            record_cmd = [
+                "rec",
+                "-q",
+                "-b", "16",      # 16-bit
+                "-r", "16000",   # Sample rate: 16kHz (what Whisper expects)
+                "-c", "1",       # Mono
+                self.temp_file.name
+            ]
+        else:
+            # Record using arecord (ALSA) - works on most Linux systems
+            record_cmd = [
                 "arecord",
                 "-f", "S16_LE",  # Format: 16-bit little-endian
                 "-r", "16000",   # Sample rate: 16kHz (what Whisper expects)
                 "-c", "1",       # Mono
                 "-t", "wav",
                 self.temp_file.name
-            ],
+            ]
+        self.record_process = subprocess.Popen(
+            record_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
@@ -150,7 +179,11 @@ class Dictation:
         self.recording = False
 
         if self.record_process:
-            self.record_process.terminate()
+            if IS_MACOS:
+                # sox finalizes the WAV header only on SIGINT, not SIGTERM
+                self.record_process.send_signal(signal.SIGINT)
+            else:
+                self.record_process.terminate()
             self.record_process.wait()
             self.record_process = None
 
@@ -176,16 +209,25 @@ class Dictation:
             text = " ".join(segment.text.strip() for segment in segments)
 
             if text:
-                # Copy to clipboard using xclip
-                process = subprocess.Popen(
-                    ["xclip", "-selection", "clipboard"],
-                    stdin=subprocess.PIPE
-                )
+                # Copy to clipboard
+                clipboard_cmd = ["pbcopy"] if IS_MACOS else ["xclip", "-selection", "clipboard"]
+                process = subprocess.Popen(clipboard_cmd, stdin=subprocess.PIPE)
                 process.communicate(input=text.encode())
 
                 # Type it into the active input field
                 if AUTO_TYPE:
-                    subprocess.run(["xdotool", "type", "--clearmodifiers", text])
+                    if IS_MACOS:
+                        # Pass text via argv to avoid AppleScript string escaping;
+                        # requires Accessibility permission for the terminal app
+                        subprocess.run([
+                            "osascript",
+                            "-e", "on run argv",
+                            "-e", 'tell application "System Events" to keystroke (item 1 of argv)',
+                            "-e", "end run",
+                            text
+                        ])
+                    else:
+                        subprocess.run(["xdotool", "type", "--clearmodifiers", text])
 
                 print(f"Copied: {text}")
                 self.notify("Copied!", text[:100] + ("..." if len(text) > 100 else ""), "emblem-ok-symbolic", 3000)
@@ -226,19 +268,24 @@ def check_dependencies():
     """Check that required system commands are available."""
     missing = []
 
-    for cmd in ["arecord", "xclip"]:
-        if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
-            pkg = "alsa-utils" if cmd == "arecord" else cmd
-            missing.append((cmd, pkg))
+    if IS_MACOS:
+        # pbcopy and osascript are built into macOS; only sox is external
+        required = [("rec", "sox")]
+        install_hint = "brew install"
+    else:
+        required = [("arecord", "alsa-utils"), ("xclip", "xclip")]
+        if AUTO_TYPE:
+            required.append(("xdotool", "xdotool"))
+        install_hint = "sudo apt install"
 
-    if AUTO_TYPE:
-        if subprocess.run(["which", "xdotool"], capture_output=True).returncode != 0:
-            missing.append(("xdotool", "xdotool"))
+    for cmd, pkg in required:
+        if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
+            missing.append((cmd, pkg))
 
     if missing:
         print("Missing dependencies:")
         for cmd, pkg in missing:
-            print(f"  {cmd} - install with: sudo apt install {pkg}")
+            print(f"  {cmd} - install with: {install_hint} {pkg}")
         sys.exit(1)
 
 

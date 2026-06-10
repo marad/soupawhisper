@@ -1,12 +1,17 @@
 # SoupaWhisper
 
-A simple push-to-talk voice dictation tool for Linux using faster-whisper. Hold a key to record, release to transcribe, and it automatically copies to clipboard and types into the active input.
+A simple push-to-talk voice dictation tool for Linux and macOS using faster-whisper. Hold a key to record, release to transcribe, and it automatically copies to clipboard and types into the active input.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (3.10-3.13 — onnxruntime ships no wheels for newer versions yet)
 - Poetry
-- Linux with X11 (ALSA audio)
+- Linux with X11 (ALSA audio), or macOS with sox (`brew install sox`)
+
+## macOS Notes
+
+- Grant the terminal you run it from: **Microphone**, **Input Monitoring** (hotkey listener), and **Accessibility** (auto-typing). macOS prompts on first use.
+- F12 doubles as a media key on Mac keyboards — hold `fn`, remap it, or set a different `key` in the config.
 
 ## Supported Distros
 
