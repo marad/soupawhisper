@@ -98,6 +98,8 @@ def get_hotkey(key_name):
 
 
 HOTKEY = get_hotkey(CONFIG["key"])
+# macOS virtual keycode of the hotkey; None for character keys (unknown keycode)
+HOTKEY_VK = HOTKEY.value.vk if isinstance(HOTKEY, keyboard.Key) else HOTKEY.vk
 MODEL_SIZE = CONFIG["model"]
 DEVICE = CONFIG["device"]
 COMPUTE_TYPE = CONFIG["compute_type"]
@@ -108,6 +110,8 @@ NOTIFICATIONS = CONFIG["notifications"]
 
 class Dictation:
     def __init__(self):
+        # Serializes start/stop now that they run on their own threads
+        self.lock = threading.Lock()
         self.recording = False
         self.record_process = None
         self.temp_file = None
@@ -278,13 +282,24 @@ class Dictation:
             if self.temp_file and os.path.exists(self.temp_file.name):
                 os.unlink(self.temp_file.name)
 
+    def _run_locked(self, fn):
+        with self.lock:
+            fn()
+
+    def _spawn(self, fn):
+        # The listener callback must return quickly: with the intercepting
+        # event tap on macOS a blocked callback stalls keyboard input
+        # system-wide until macOS disables the tap. The lock keeps
+        # start/stop serialized as they were when run on the callback thread.
+        threading.Thread(target=self._run_locked, args=(fn,), daemon=True).start()
+
     def on_press(self, key):
         if key == HOTKEY:
-            self.start_recording()
+            self._spawn(self.start_recording)
 
     def on_release(self, key):
         if key == HOTKEY:
-            self.stop_recording()
+            self._spawn(self.stop_recording)
 
     def stop(self):
         print("\nExiting...")
@@ -292,10 +307,24 @@ class Dictation:
         os._exit(0)
 
     def run(self):
-        with keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release
-        ) as listener:
+        listener_kwargs = {
+            "on_press": self.on_press,
+            "on_release": self.on_release,
+        }
+        if IS_MACOS and HOTKEY_VK is not None:
+            import Quartz
+
+            def suppress_hotkey(event_type, event):
+                # Swallow the push-to-talk key so other applications never
+                # see it; pynput dispatches on_press/on_release before this
+                keycode = Quartz.CGEventGetIntegerValueField(
+                    event, Quartz.kCGKeyboardEventKeycode
+                )
+                return None if keycode == HOTKEY_VK else event
+
+            listener_kwargs["darwin_intercept"] = suppress_hotkey
+
+        with keyboard.Listener(**listener_kwargs) as listener:
             listener.join()
 
 
