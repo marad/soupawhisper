@@ -64,15 +64,15 @@ def get_default_input_device():
         return None  # arecord uses the ALSA "default" device
     try:
         result = subprocess.run(
-            ["system_profiler", "SPAudioDataType", "-json"],
+            ["/usr/sbin/system_profiler", "SPAudioDataType", "-json"],
             capture_output=True, text=True, timeout=15,
         )
         items = json.loads(result.stdout)["SPAudioDataType"][0]["_items"]
         for item in items:
             if item.get("coreaudio_default_audio_input_device") == "spaudio_yes":
                 return item["_name"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Could not determine input device: {e}")
     return None
 
 
@@ -81,6 +81,8 @@ def print_input_device():
     device = get_default_input_device()
     if device:
         print(f"Recording from: {device}")
+    else:
+        print("Recording from: system default input (could not resolve name)")
 
 
 def get_hotkey(key_name):
