@@ -22,8 +22,9 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.10"
-faster-whisper = "^1.0.0"
+faster-whisper = {version = "^1.0.0", markers = "sys_platform != 'darwin'"}
 pynput = "^1.7.6"
+mlx-whisper = {version = "^0.4", markers = "sys_platform == 'darwin'"}
 
 [build-system]
 requires = ["poetry-core"]

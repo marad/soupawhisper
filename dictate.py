@@ -6,6 +6,7 @@ Hold the hotkey to record, release to transcribe and copy to clipboard.
 
 import argparse
 import configparser
+from concurrent.futures import ThreadPoolExecutor
 import json
 import platform
 import subprocess
@@ -17,11 +18,16 @@ import os
 from pathlib import Path
 
 from pynput import keyboard
-from faster_whisper import WhisperModel
 
 __version__ = "0.1.0"
 
 IS_MACOS = platform.system() == "Darwin"
+
+if IS_MACOS:
+    # Metal-accelerated Whisper on Apple Silicon
+    import mlx_whisper
+else:
+    from faster_whisper import WhisperModel
 
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
@@ -97,10 +103,31 @@ def get_hotkey(key_name):
         return keyboard.Key.f12
 
 
+def get_mlx_model_repo(name):
+    """Full HF repo paths pass through; bare sizes map to mlx-community repos."""
+    return name if "/" in name else f"mlx-community/whisper-{name}-mlx"
+
+
+def load_wav(path):
+    """Load a 16kHz mono 16-bit WAV as float32 in [-1, 1].
+
+    mlx-whisper shells out to ffmpeg when given a path; our recordings are
+    already in Whisper's native format, so decode them without it.
+    """
+    import wave
+
+    import numpy as np
+
+    with wave.open(path, "rb") as w:
+        frames = w.readframes(w.getnframes())
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 HOTKEY = get_hotkey(CONFIG["key"])
 # macOS virtual keycode of the hotkey; None for character keys (unknown keycode)
 HOTKEY_VK = HOTKEY.value.vk if isinstance(HOTKEY, keyboard.Key) else HOTKEY.vk
 MODEL_SIZE = CONFIG["model"]
+MODEL_REPO = get_mlx_model_repo(MODEL_SIZE) if IS_MACOS else None
 DEVICE = CONFIG["device"]
 COMPUTE_TYPE = CONFIG["compute_type"]
 LANGUAGE = CONFIG["language"] or None  # None = auto-detect
@@ -120,6 +147,11 @@ class Dictation:
         self.model_error = None
         self.running = True
 
+        if IS_MACOS:
+            # MLX streams are bound to the thread that created them, so a
+            # single thread must own all MLX work (model load + transcribe)
+            self.mlx = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+
         # Load model in background
         print(f"Loading Whisper model ({MODEL_SIZE})...")
         threading.Thread(target=self._load_model, daemon=True).start()
@@ -129,7 +161,17 @@ class Dictation:
 
     def _load_model(self):
         try:
-            self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+            if IS_MACOS:
+                # Download and load the model upfront; ModelHolder caches it
+                # for the mlx_whisper.transcribe() calls
+                def load():
+                    import mlx.core as mx
+                    from mlx_whisper.transcribe import ModelHolder
+                    ModelHolder.get_model(MODEL_REPO, mx.float16)
+
+                self.mlx.submit(load).result()
+            else:
+                self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
             self.model_loaded.set()
             hotkey_name = HOTKEY.name if hasattr(HOTKEY, 'name') else HOTKEY.char
             print(f"Model loaded. Ready for dictation!")
@@ -238,14 +280,22 @@ class Dictation:
 
         # Transcribe
         try:
-            segments, info = self.model.transcribe(
-                self.temp_file.name,
-                beam_size=5,
-                vad_filter=True,
-                language=LANGUAGE,
-            )
-
-            text = " ".join(segment.text.strip() for segment in segments)
+            if IS_MACOS:
+                result = self.mlx.submit(
+                    mlx_whisper.transcribe,
+                    load_wav(self.temp_file.name),
+                    path_or_hf_repo=MODEL_REPO,
+                    language=LANGUAGE,
+                ).result()
+                text = result["text"].strip()
+            else:
+                segments, info = self.model.transcribe(
+                    self.temp_file.name,
+                    beam_size=5,
+                    vad_filter=True,
+                    language=LANGUAGE,
+                )
+                text = " ".join(segment.text.strip() for segment in segments)
 
             if text:
                 # Copy to clipboard

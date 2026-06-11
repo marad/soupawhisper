@@ -1,6 +1,6 @@
 # SoupaWhisper
 
-A simple push-to-talk voice dictation tool for Linux and macOS using faster-whisper. Hold a key to record, release to transcribe, and it automatically copies to clipboard and types into the active input.
+A simple push-to-talk voice dictation tool for Linux and macOS using Whisper (mlx-whisper on Apple Silicon, faster-whisper elsewhere). Hold a key to record, release to transcribe, and it automatically copies to clipboard and types into the active input.
 
 ## Requirements
 
