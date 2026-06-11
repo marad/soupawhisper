@@ -9,6 +9,7 @@ import configparser
 from concurrent.futures import ThreadPoolExecutor
 import json
 import platform
+import re
 import subprocess
 import tempfile
 import threading
@@ -60,6 +61,7 @@ def load_config():
         "key": config.get("hotkey", "key", fallback=defaults["key"]),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
+        "replacements": dict(config.items("replacements")) if config.has_section("replacements") else {},
     }
 
 
@@ -135,6 +137,19 @@ COMPUTE_TYPE = CONFIG["compute_type"]
 LANGUAGE = CONFIG["language"] or None  # None = auto-detect
 # Domain terms fed to Whisper as initial_prompt to bias their spelling
 INITIAL_PROMPT = CONFIG["vocabulary"].strip() or None
+REPLACEMENTS = CONFIG["replacements"]
+
+
+def apply_replacements(text):
+    """Fix recurring mistranscriptions the model cannot get right.
+
+    Matches case-insensitively from a word boundary but replaces only the
+    matched prefix, so inflected forms keep their suffix
+    ("Heilangiem" -> "ChiLangiem").
+    """
+    for wrong, right in REPLACEMENTS.items():
+        text = re.sub(rf"\b{re.escape(wrong)}", right, text, flags=re.IGNORECASE)
+    return text
 AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
 
@@ -302,6 +317,8 @@ class Dictation:
                     initial_prompt=INITIAL_PROMPT,
                 )
                 text = " ".join(segment.text.strip() for segment in segments)
+
+            text = apply_replacements(text)
 
             if text:
                 # Copy to clipboard
