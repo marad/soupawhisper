@@ -42,6 +42,7 @@ def load_config():
         "device": "cpu",
         "compute_type": "int8",
         "language": "",
+        "vocabulary": "",
         "key": "f12",
         "auto_type": "true",
         "notifications": "true",
@@ -55,6 +56,7 @@ def load_config():
         "device": config.get("whisper", "device", fallback=defaults["device"]),
         "compute_type": config.get("whisper", "compute_type", fallback=defaults["compute_type"]),
         "language": config.get("whisper", "language", fallback=defaults["language"]),
+        "vocabulary": config.get("whisper", "vocabulary", fallback=defaults["vocabulary"]),
         "key": config.get("hotkey", "key", fallback=defaults["key"]),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
@@ -131,6 +133,8 @@ MODEL_REPO = get_mlx_model_repo(MODEL_SIZE) if IS_MACOS else None
 DEVICE = CONFIG["device"]
 COMPUTE_TYPE = CONFIG["compute_type"]
 LANGUAGE = CONFIG["language"] or None  # None = auto-detect
+# Domain terms fed to Whisper as initial_prompt to bias their spelling
+INITIAL_PROMPT = CONFIG["vocabulary"].strip() or None
 AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
 
@@ -286,6 +290,7 @@ class Dictation:
                     load_wav(self.temp_file.name),
                     path_or_hf_repo=MODEL_REPO,
                     language=LANGUAGE,
+                    initial_prompt=INITIAL_PROMPT,
                 ).result()
                 text = result["text"].strip()
             else:
@@ -294,6 +299,7 @@ class Dictation:
                     beam_size=5,
                     vad_filter=True,
                     language=LANGUAGE,
+                    initial_prompt=INITIAL_PROMPT,
                 )
                 text = " ".join(segment.text.strip() for segment in segments)
 
