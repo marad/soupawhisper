@@ -23,6 +23,10 @@ from pynput import keyboard
 __version__ = "0.1.0"
 
 IS_MACOS = platform.system() == "Darwin"
+# On Linux the clipboard/typing backend and hotkey strategy differ between X11
+# (xclip/xdotool, global key listener) and Wayland (wl-copy/wtype, no global
+# grab — the compositor binds a key to `dictate.py toggle` instead).
+IS_WAYLAND = not IS_MACOS and os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
 if IS_MACOS:
     # Metal-accelerated Whisper on Apple Silicon
@@ -32,6 +36,8 @@ else:
 
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
+# Daemon mode (Wayland) writes its PID here so `dictate.py toggle` can signal it
+PIDFILE = Path(tempfile.gettempdir()) / "soupawhisper.pid"
 
 
 def load_config():
@@ -322,7 +328,12 @@ class Dictation:
 
             if text:
                 # Copy to clipboard
-                clipboard_cmd = ["pbcopy"] if IS_MACOS else ["xclip", "-selection", "clipboard"]
+                if IS_MACOS:
+                    clipboard_cmd = ["pbcopy"]
+                elif IS_WAYLAND:
+                    clipboard_cmd = ["wl-copy"]
+                else:
+                    clipboard_cmd = ["xclip", "-selection", "clipboard"]
                 process = subprocess.Popen(clipboard_cmd, stdin=subprocess.PIPE)
                 process.communicate(input=text.encode())
 
@@ -338,6 +349,8 @@ class Dictation:
                             "-e", "end run",
                             text
                         ])
+                    elif IS_WAYLAND:
+                        subprocess.run(["wtype", text])
                     else:
                         subprocess.run(["xdotool", "type", "--clearmodifiers", text])
 
@@ -374,9 +387,29 @@ class Dictation:
         if key == HOTKEY:
             self._spawn(self.stop_recording)
 
+    def toggle(self):
+        """Toggle recording on/off (driven by an external signal)."""
+        self._spawn(self.stop_recording if self.recording else self.start_recording)
+
+    def run_daemon(self):
+        """Run headless, toggling on SIGUSR1.
+
+        Used on Wayland, where pynput cannot grab a global hotkey: the
+        compositor binds a key to `dictate.py toggle`, which signals us.
+        """
+        PIDFILE.write_text(str(os.getpid()))
+        signal.signal(signal.SIGUSR1, lambda sig, frame: self.toggle())
+        print(f"Daemon mode. Send SIGUSR1 (kill -USR1 {os.getpid()}) or run: dictate.py toggle")
+        try:
+            while self.running:
+                signal.pause()
+        finally:
+            PIDFILE.unlink(missing_ok=True)
+
     def stop(self):
         print("\nExiting...")
         self.running = False
+        PIDFILE.unlink(missing_ok=True)
         os._exit(0)
 
     def run(self):
@@ -409,6 +442,11 @@ def check_dependencies():
         # pbcopy and osascript are built into macOS; only sox is external
         required = [("rec", "sox")]
         install_hint = "brew install"
+    elif IS_WAYLAND:
+        required = [("arecord", "alsa-utils"), ("wl-copy", "wl-clipboard")]
+        if AUTO_TYPE:
+            required.append(("wtype", "wtype"))
+        install_hint = "sudo apt install"
     else:
         required = [("arecord", "alsa-utils"), ("xclip", "xclip")]
         if AUTO_TYPE:
@@ -426,6 +464,19 @@ def check_dependencies():
         sys.exit(1)
 
 
+def send_toggle():
+    """Signal a running daemon to start/stop recording, then exit."""
+    if not PIDFILE.exists():
+        print("SoupaWhisper daemon is not running.")
+        sys.exit(1)
+    try:
+        os.kill(int(PIDFILE.read_text().strip()), signal.SIGUSR1)
+    except (ProcessLookupError, ValueError):
+        print("SoupaWhisper daemon is not running (stale pidfile).")
+        PIDFILE.unlink(missing_ok=True)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SoupaWhisper - Push-to-talk voice dictation"
@@ -435,7 +486,18 @@ def main():
         action="version",
         version=f"SoupaWhisper {__version__}"
     )
-    parser.parse_args()
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["toggle", "daemon"],
+        help="toggle: signal a running daemon to start/stop recording. "
+             "daemon: run headless, controlled via SIGUSR1 (used on Wayland)."
+    )
+    args = parser.parse_args()
+
+    if args.command == "toggle":
+        send_toggle()
+        return
 
     print(f"SoupaWhisper v{__version__}")
     print(f"Config: {CONFIG_PATH}")
@@ -450,7 +512,12 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    dictation.run()
+    # Wayland has no global hotkey grab, so fall back to signal-driven daemon
+    # mode automatically; X11 and macOS use the push-to-talk key listener.
+    if args.command == "daemon" or IS_WAYLAND:
+        dictation.run_daemon()
+    else:
+        dictation.run()
 
 
 if __name__ == "__main__":
