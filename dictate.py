@@ -171,11 +171,12 @@ SAMPLE_RATE = 16000
 #   1. an energy gate that drops a recording with no real speech in it, and
 #   2. a blocklist of phrases Whisper never produces from genuine dictation.
 
-# A 1-second window whose RMS reaches this level counts as "active" (real audio).
-# Genuine speech peaks well above this; dead air / faint noise stays below.
-SILENCE_DBFS = -45.0
-# If fewer than this fraction of 1s windows are active, treat the clip as silence.
-MIN_ACTIVE_FRACTION = 0.005
+# The clip is silence only if its LOUDEST 100ms window stays below this level.
+# Genuine speech always has at least one window well above it, even on a quiet
+# mic; dead air / faint noise stays below. Deliberately lenient — keeping a
+# borderline-quiet recording is cheap, dropping a real one is not, and the
+# stock-phrase blocklist below catches hallucinations over low-level noise.
+SILENCE_DBFS = -50.0
 
 # Stock phrases Whisper hallucinates over silence/noise. Matched anywhere in a
 # SHORT transcription only (see HALLUCINATION_MAXLEN) so a long real dictation
@@ -193,23 +194,26 @@ HALLUCINATION_MAXLEN = 60
 def is_silent(audio):
     """True if the recording holds essentially no audible speech.
 
-    Whisper hallucinates stock phrases over silence, so a clip that never rises
-    above SILENCE_DBFS in any 1-second window is dropped before it reaches the
-    model. RMS-per-window mirrors transcribe.py's active_fraction gate.
+    Whisper hallucinates stock phrases over silence, so a clip whose loudest
+    100ms window never reaches SILENCE_DBFS is dropped before it reaches the
+    model. Looking at the PEAK window (not mean energy) keeps quiet-mic speech:
+    real speech always has at least one loud window, while dead air does not.
+    Mirrors transcribe.py's peak_rms_dbfs gate.
     """
     import numpy as np
 
     if audio.size == 0:
         return True
-    usable = max(audio.size // SAMPLE_RATE, 1) * SAMPLE_RATE
-    if audio.size < usable:
-        # Shorter than 1s: judge the whole clip as a single window.
+    win = max(SAMPLE_RATE // 10, 1)  # 100ms windows
+    usable = (audio.size // win) * win
+    if usable == 0:
+        # Shorter than one window: judge the whole clip as a single window.
         windows = audio.reshape(1, -1)
     else:
-        windows = audio[:usable].reshape(-1, SAMPLE_RATE)
+        windows = audio[:usable].reshape(-1, win)
     rms = np.sqrt((windows ** 2).mean(axis=1))
-    active_fraction = float((rms > 10 ** (SILENCE_DBFS / 20)).mean())
-    return active_fraction < MIN_ACTIVE_FRACTION
+    peak_dbfs = 20 * np.log10(max(float(rms.max()), 1e-9))
+    return peak_dbfs < SILENCE_DBFS
 
 
 def is_hallucination(text):
