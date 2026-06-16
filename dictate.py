@@ -53,6 +53,7 @@ def load_config():
         "key": "f12",
         "auto_type": "true",
         "notifications": "true",
+        "restore_clipboard": "true",
     }
 
     if CONFIG_PATH.exists():
@@ -67,6 +68,7 @@ def load_config():
         "key": config.get("hotkey", "key", fallback=defaults["key"]),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
+        "restore_clipboard": config.getboolean("behavior", "restore_clipboard", fallback=True),
         "replacements": dict(config.items("replacements")) if config.has_section("replacements") else {},
     }
 
@@ -158,6 +160,90 @@ def apply_replacements(text):
     return text
 AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
+RESTORE_CLIPBOARD = CONFIG["restore_clipboard"]
+
+# Sample rate of the recordings (see the rec/arecord commands below).
+SAMPLE_RATE = 16000
+
+# Hallucination control. Whisper invents stock phrases ("dziękuję za oglądanie",
+# "thanks for watching", subtitle credits) when handed silence or background
+# noise. Two defences, mirrored from the meeting recorder's transcribe.py:
+#   1. an energy gate that drops a recording with no real speech in it, and
+#   2. a blocklist of phrases Whisper never produces from genuine dictation.
+
+# A 1-second window whose RMS reaches this level counts as "active" (real audio).
+# Genuine speech peaks well above this; dead air / faint noise stays below.
+SILENCE_DBFS = -45.0
+# If fewer than this fraction of 1s windows are active, treat the clip as silence.
+MIN_ACTIVE_FRACTION = 0.005
+
+# Stock phrases Whisper hallucinates over silence/noise. Matched anywhere in a
+# SHORT transcription only (see HALLUCINATION_MAXLEN) so a long real dictation
+# that happens to contain one of these words is never dropped.
+HALLUCINATION_PHRASES = (
+    r"napisy\b", r"subtitles?\b", r"amara\.org",
+    r"transcri(b|p)tion by", r"prenumeruj", r"zasubskrybuj",
+    r"dzięki za (ogląd|uwag)", r"dziękuję za (ogląd|uwag)",
+    r"thanks? for watching",
+)
+_HALLUC_RE = re.compile("|".join(HALLUCINATION_PHRASES), re.I)
+HALLUCINATION_MAXLEN = 60
+
+
+def is_silent(audio):
+    """True if the recording holds essentially no audible speech.
+
+    Whisper hallucinates stock phrases over silence, so a clip that never rises
+    above SILENCE_DBFS in any 1-second window is dropped before it reaches the
+    model. RMS-per-window mirrors transcribe.py's active_fraction gate.
+    """
+    import numpy as np
+
+    if audio.size == 0:
+        return True
+    usable = max(audio.size // SAMPLE_RATE, 1) * SAMPLE_RATE
+    if audio.size < usable:
+        # Shorter than 1s: judge the whole clip as a single window.
+        windows = audio.reshape(1, -1)
+    else:
+        windows = audio[:usable].reshape(-1, SAMPLE_RATE)
+    rms = np.sqrt((windows ** 2).mean(axis=1))
+    active_fraction = float((rms > 10 ** (SILENCE_DBFS / 20)).mean())
+    return active_fraction < MIN_ACTIVE_FRACTION
+
+
+def is_hallucination(text):
+    """True if a short transcription matches a known Whisper stock phrase."""
+    return len(text) <= HALLUCINATION_MAXLEN and bool(_HALLUC_RE.search(text))
+
+
+def get_clipboard():
+    """Current clipboard text, or None if unreadable (e.g. image/empty)."""
+    if IS_MACOS:
+        cmd = ["pbpaste"]
+    elif IS_WAYLAND:
+        cmd = ["wl-paste", "--no-newline"]
+    else:
+        cmd = ["xclip", "-selection", "clipboard", "-o"]
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except Exception:
+        return None
+
+
+def set_clipboard(data):
+    """Write raw bytes to the clipboard."""
+    if IS_MACOS:
+        cmd = ["pbcopy"]
+    elif IS_WAYLAND:
+        cmd = ["wl-copy"]
+    else:
+        cmd = ["xclip", "-selection", "clipboard"]
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    process.communicate(input=data)
 
 
 class Dictation:
@@ -305,13 +391,29 @@ class Dictation:
 
         # Transcribe
         try:
+            audio = load_wav(self.temp_file.name)
+
+            # Drop silent / no-speech recordings before the model runs, so it
+            # can't hallucinate stock phrases ("dziękuję za oglądanie") over them.
+            if is_silent(audio):
+                print("No speech detected (silent recording)")
+                self.notify("No speech detected", "Try speaking louder", "dialog-warning", 2000)
+                return
+
             if IS_MACOS:
                 result = self.mlx.submit(
                     mlx_whisper.transcribe,
-                    load_wav(self.temp_file.name),
+                    audio,
                     path_or_hf_repo=MODEL_REPO,
                     language=LANGUAGE,
                     initial_prompt=INITIAL_PROMPT,
+                    # Each 30s window starts clean from initial_prompt instead of
+                    # looping on its own hallucinations over quiet stretches.
+                    condition_on_previous_text=False,
+                    # Skip silent gaps (>2s) Whisper would otherwise fill with
+                    # invented speech. Requires word_timestamps.
+                    word_timestamps=True,
+                    hallucination_silence_threshold=2.0,
                 ).result()
                 text = result["text"].strip()
             else:
@@ -321,21 +423,29 @@ class Dictation:
                     vad_filter=True,
                     language=LANGUAGE,
                     initial_prompt=INITIAL_PROMPT,
+                    condition_on_previous_text=False,
                 )
                 text = " ".join(segment.text.strip() for segment in segments)
 
             text = apply_replacements(text)
 
+            # Final guard: faint clips that slip past the energy gate still tend
+            # to decode to one of Whisper's stock phrases. Drop those too.
+            if text and is_hallucination(text):
+                print(f"Dropped hallucination: {text}")
+                self.notify("No speech detected", "Try speaking louder", "dialog-warning", 2000)
+                text = ""
+
             if text:
+                # When auto-typing, the clipboard is only a scratch buffer, so
+                # snapshot its previous contents and restore them afterwards.
+                # When not auto-typing, the clipboard IS the delivery mechanism,
+                # so we must leave the transcription there.
+                restore = RESTORE_CLIPBOARD and AUTO_TYPE
+                previous_clipboard = get_clipboard() if restore else None
+
                 # Copy to clipboard
-                if IS_MACOS:
-                    clipboard_cmd = ["pbcopy"]
-                elif IS_WAYLAND:
-                    clipboard_cmd = ["wl-copy"]
-                else:
-                    clipboard_cmd = ["xclip", "-selection", "clipboard"]
-                process = subprocess.Popen(clipboard_cmd, stdin=subprocess.PIPE)
-                process.communicate(input=text.encode())
+                set_clipboard(text.encode())
 
                 # Type it into the active input field
                 if AUTO_TYPE:
@@ -353,6 +463,11 @@ class Dictation:
                         subprocess.run(["wtype", text])
                     else:
                         subprocess.run(["xdotool", "type", "--clearmodifiers", text])
+
+                # Typing synthesizes key events and never reads the clipboard,
+                # so once subprocess.run returns it is safe to restore.
+                if restore and previous_clipboard is not None:
+                    set_clipboard(previous_clipboard)
 
                 print(f"Copied: {text}")
                 self.notify("Copied!", text[:100] + ("..." if len(text) > 100 else ""), "emblem-ok-symbolic", 3000)
