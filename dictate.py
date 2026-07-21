@@ -138,6 +138,14 @@ def load_wav(path):
 HOTKEY = get_hotkey(CONFIG["key"])
 # macOS virtual keycode of the hotkey; None for character keys (unknown keycode)
 HOTKEY_VK = HOTKEY.value.vk if isinstance(HOTKEY, keyboard.Key) else HOTKEY.vk
+# Modifier keys we refuse to fire alongside: a hotkey held WITH a modifier
+# (e.g. Shift+F13) belongs to another tool, so we neither trigger nor swallow it.
+MODIFIER_KEYS = frozenset({
+    keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r,
+    keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r,
+    keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr,
+    keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r,
+})
 MODEL_SIZE = CONFIG["model"]
 MODEL_REPO = get_mlx_model_repo(MODEL_SIZE) if IS_MACOS else None
 DEVICE = CONFIG["device"]
@@ -261,6 +269,8 @@ class Dictation:
         self.model_loaded = threading.Event()
         self.model_error = None
         self.running = True
+        # Modifiers currently held; mutated only on the single listener thread
+        self.held_modifiers = set()
 
         if IS_MACOS:
             # MLX streams are bound to the thread that created them, so a
@@ -499,11 +509,16 @@ class Dictation:
         threading.Thread(target=self._run_locked, args=(fn,), daemon=True).start()
 
     def on_press(self, key):
-        if key == HOTKEY:
+        if key in MODIFIER_KEYS:
+            self.held_modifiers.add(key)
+        elif key == HOTKEY and not self.held_modifiers:
+            # Bare hotkey only; Shift+hotkey etc. belongs to another tool
             self._spawn(self.start_recording)
 
     def on_release(self, key):
-        if key == HOTKEY:
+        if key in MODIFIER_KEYS:
+            self.held_modifiers.discard(key)
+        elif key == HOTKEY:
             self._spawn(self.stop_recording)
 
     def toggle(self):
@@ -538,14 +553,54 @@ class Dictation:
         }
         if IS_MACOS and HOTKEY_VK is not None:
             import Quartz
+            from pynput._util import darwin as pynput_darwin
+
+            modifier_mask = (
+                Quartz.kCGEventFlagMaskShift
+                | Quartz.kCGEventFlagMaskControl
+                | Quartz.kCGEventFlagMaskAlternate
+                | Quartz.kCGEventFlagMaskCommand
+            )
+
+            # macOS disables a CGEventTap whose callback ran too long
+            # (kCGEventTapDisabledByTimeout) or under heavy input
+            # (...ByUserInput). pynput never re-enables it, so the global
+            # hotkey silently dies while this process keeps running. Capture
+            # pynput's tap so suppress_hotkey can revive it on a disable event.
+            tap_ref = {}
+            orig_create_tap = pynput_darwin.ListenerMixin._create_event_tap
+
+            def capturing_create_tap(listener_self):
+                tap = orig_create_tap(listener_self)
+                tap_ref["tap"] = tap
+                return tap
+
+            pynput_darwin.ListenerMixin._create_event_tap = capturing_create_tap
+
+            TAP_DISABLED = (
+                Quartz.kCGEventTapDisabledByTimeout,
+                Quartz.kCGEventTapDisabledByUserInput,
+            )
 
             def suppress_hotkey(event_type, event):
+                if event_type in TAP_DISABLED:
+                    tap = tap_ref.get("tap")
+                    if tap is not None:
+                        Quartz.CGEventTapEnable(tap, True)
+                        print("Event tap disabled by macOS; re-enabled.", flush=True)
+                    return event
                 # Swallow the push-to-talk key so other applications never
-                # see it; pynput dispatches on_press/on_release before this
+                # see it; pynput dispatches on_press/on_release before this.
+                # But let it through when a modifier is held (e.g. Shift+F13),
+                # so other tools can bind the modified combo.
                 keycode = Quartz.CGEventGetIntegerValueField(
                     event, Quartz.kCGKeyboardEventKeycode
                 )
-                return None if keycode == HOTKEY_VK else event
+                if keycode != HOTKEY_VK:
+                    return event
+                if Quartz.CGEventGetFlags(event) & modifier_mask:
+                    return event
+                return None
 
             listener_kwargs["darwin_intercept"] = suppress_hotkey
 
