@@ -292,6 +292,11 @@ class Dictation:
                 def load():
                     import mlx.core as mx
                     from mlx_whisper.transcribe import ModelHolder
+                    # MLX keeps freed Metal buffers in an unbounded cache. Every
+                    # recording length allocates differently-sized buffers, so a
+                    # long-running daemon grows to tens of GB of IOAccelerator
+                    # memory. Cap the cache; MLX reuses or frees past this.
+                    mx.set_cache_limit(512 * 1024 * 1024)
                     ModelHolder.get_model(MODEL_REPO, mx.float16)
 
                 self.mlx.submit(load).result()
