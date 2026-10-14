@@ -31,6 +31,7 @@ IS_WAYLAND = not IS_MACOS and os.environ.get("XDG_SESSION_TYPE") == "wayland"
 if IS_MACOS:
     # Metal-accelerated Whisper on Apple Silicon
     import mlx_whisper
+    import Quartz
 else:
     from faster_whisper import WhisperModel
 
@@ -146,6 +147,13 @@ MODIFIER_KEYS = frozenset({
     keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr,
     keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r,
 })
+if IS_MACOS:
+    MODIFIER_MASK = (
+        Quartz.kCGEventFlagMaskShift
+        | Quartz.kCGEventFlagMaskControl
+        | Quartz.kCGEventFlagMaskAlternate
+        | Quartz.kCGEventFlagMaskCommand
+    )
 MODEL_SIZE = CONFIG["model"]
 MODEL_REPO = get_mlx_model_repo(MODEL_SIZE) if IS_MACOS else None
 DEVICE = CONFIG["device"]
@@ -513,10 +521,21 @@ class Dictation:
         # start/stop serialized as they were when run on the callback thread.
         threading.Thread(target=self._run_locked, args=(fn,), daemon=True).start()
 
+    def _modifier_held(self):
+        if IS_MACOS:
+            # Ask the hardware instead of trusting held_modifiers: a release
+            # the tap never saw (keys let go on the lock screen) would leave a
+            # modifier "held" forever and block the hotkey until restart.
+            state = Quartz.CGEventSourceFlagsState(
+                Quartz.kCGEventSourceStateHIDSystemState
+            )
+            return bool(state & MODIFIER_MASK)
+        return bool(self.held_modifiers)
+
     def on_press(self, key):
         if key in MODIFIER_KEYS:
             self.held_modifiers.add(key)
-        elif key == HOTKEY and not self.held_modifiers:
+        elif key == HOTKEY and not self._modifier_held():
             # Bare hotkey only; Shift+hotkey etc. belongs to another tool
             self._spawn(self.start_recording)
 
@@ -557,15 +576,7 @@ class Dictation:
             "on_release": self.on_release,
         }
         if IS_MACOS and HOTKEY_VK is not None:
-            import Quartz
             from pynput._util import darwin as pynput_darwin
-
-            modifier_mask = (
-                Quartz.kCGEventFlagMaskShift
-                | Quartz.kCGEventFlagMaskControl
-                | Quartz.kCGEventFlagMaskAlternate
-                | Quartz.kCGEventFlagMaskCommand
-            )
 
             # macOS disables a CGEventTap whose callback ran too long
             # (kCGEventTapDisabledByTimeout) or under heavy input
@@ -603,7 +614,8 @@ class Dictation:
                 )
                 if keycode != HOTKEY_VK:
                     return event
-                if Quartz.CGEventGetFlags(event) & modifier_mask:
+                # Not the event's flags: must match the recording decision
+                if self._modifier_held():
                     return event
                 return None
 
