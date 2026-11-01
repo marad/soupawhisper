@@ -22,6 +22,10 @@ from pynput import keyboard
 
 __version__ = "0.1.0"
 
+# Under systemd/launchd stdout is a pipe, so Python block-buffers it and status
+# lines never reach the journal until the buffer fills.
+sys.stdout.reconfigure(line_buffering=True)
+
 IS_MACOS = platform.system() == "Darwin"
 # On Linux the clipboard/typing backend and hotkey strategy differ between X11
 # (xclip/xdotool, global key listener) and Wayland (wl-copy/wtype, no global
