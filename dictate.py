@@ -13,6 +13,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import signal
 import sys
 import os
@@ -312,6 +313,7 @@ class Dictation:
                     ModelHolder.get_model(MODEL_REPO, mx.float16)
 
                 self.mlx.submit(load).result()
+                threading.Thread(target=self._keep_warm, daemon=True).start()
             else:
                 self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
             self.model_loaded.set()
@@ -325,6 +327,20 @@ class Dictation:
             print(f"Failed to load model: {e}")
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
                 print("Hint: Try setting device = cpu in your config, or install cuDNN.")
+
+    def _keep_warm(self):
+        # Under memory pressure macOS pages out an idle daemon and the next
+        # dictation waits seconds for page-ins. Touching only the weights is
+        # not enough; a full transcription keeps the whole path resident.
+        import numpy as np
+        silence = np.zeros(16000, dtype=np.float32)
+        while self.running:
+            time.sleep(60)
+            if not self.recording:
+                self.mlx.submit(
+                    mlx_whisper.transcribe, silence,
+                    path_or_hf_repo=MODEL_REPO, language=LANGUAGE,
+                ).result()
 
     def notify(self, title, message, icon="dialog-information", timeout=2000):
         """Send a desktop notification."""
